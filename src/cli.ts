@@ -4,193 +4,108 @@
 import { program } from "commander"
 import * as fs from "fs"
 import { Book } from "./modules/Book.js"
-import { FormatPageTemplate, VerboseLog } from "./modules/Utilities.js";
+import { FormatPageTemplate, VerboseLog } from "./modules/Utilities.js"
 import chalk from "chalk"
-import imageSize from "image-size";
-import puppeteer from "puppeteer";
-import PDFMerger from "pdf-merger-js";
+import imageSize from "image-size"
+import puppeteer from "puppeteer"
+import PDFMerger from "pdf-merger-js"
 
-// Vars
+// Load package metadata
 const PackageData = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf-8"))
 
-// Program Data
+// CLI metadata
 program
-    .name(PackageData.name)
-    .description(PackageData.description)
-    .version(PackageData.version);
+  .name(PackageData.name)
+  .description(PackageData.description)
+  .version(PackageData.version)
 
-// Creates the cookie jar
-interface IConfigureOptions {
-    file: string
-}
-interface IConfigureData {
-    "ASP.NET_SessionId": string
-}
-{
-    const Command = program.command("configure").description("Configure in order to be able to use")
+// Configure session
+program
+  .command("configure")
+  .description("Configure your CGP session")
+  .argument("<session-id>", "ASP.NET_SessionId")
+  .option("-f, --file <path>", "Path to config file", "config.json")
+  .action((SessionId, options) => {
+    const config = { "ASP.NET_SessionId": SessionId }
+    fs.writeFileSync(options.file, JSON.stringify(config))
+    console.log(chalk.bgGreen("Session configured"))
+  })
 
-    // Arguments
-    Command.argument("<session-id>", "ASP.NET_SessionId")
+// Rip book
+program
+  .command("rip")
+  .description("Rip a CGP book to PDF")
+  .argument("<book-id>", "Book ID")
+  .option("-p, --pages <number>", "Number of pages to rip")
+  .option("-q, --quality <number>", "Background quality (1–4)", "4")
+  .option("-o, --output <directory>", "Output directory", "./")
+  .option("-f, --file <path>", "Config file path", "config.json")
+  .option("-v, --verbose", "Enable verbose output", true)
+  .option("-u, --uni <token>", "UNI token for SVG access")
+  .action(async (BookId, options) => {
+    // Load session config
+    if (!fs.existsSync(options.file)) {
+      throw new Error("Config file not found. Run 'configure' first.")
+    }
 
-    // Options 
-    Command.option("-f, --file", "The path to the configuration file", "config.json")
+    const config = JSON.parse(fs.readFileSync(options.file, "utf-8"))
+    const { CloudFrontCookies } = await Book.GenerateCloudFront(BookId, config["ASP.NET_SessionId"])
+    const book = new Book({ BookId, CloudFront: CloudFrontCookies })
 
-    // Main functionality
-    Command.action(async (SessionId: string, Options: IConfigureOptions) => {
-        // Vars
-        let config: IConfigureData = {
-            "ASP.NET_SessionId": SessionId
-        }
-        const file = Options.file
+    // Validate page count
+    const Pages = parseInt(options.pages)
+    if (isNaN(Pages)) {
+      throw new Error("Invalid page count. Use --pages <number>")
+    }
 
-        // See if we currently have a config
-        if (fs.existsSync(file)) {
-            config = JSON.parse(fs.readFileSync(file, "utf-8"))
-        }
+    // Validate quality
+    const Quality = parseInt(options.quality)
+    if (![1, 2, 3, 4].includes(Quality)) {
+      throw new Error("Quality must be between 1 and 4")
+    }
 
-        // Add each cookie if it is inputted
-        if (SessionId != "")
-            config["ASP.NET_SessionId"] = SessionId
+    const Verbose = options.verbose
+    const uniToken = options.uni || ""
 
-        // Output to file
-        const FormattedJar = JSON.stringify(config)
-        fs.writeFileSync(file, FormattedJar)
+    // Launch Puppeteer
+    VerboseLog(Verbose, "Info", "Launching Puppeteer")
+    const browser = await puppeteer.launch()
+    const [page] = await browser.pages()
+    const merger = new PDFMerger()
 
-        //
-        console.log(chalk.bgGreen("Done"))
-    })
-}
+    // Build each page
+    async function BuildPage(i: number) {
+      const SVGBuffer = await book.GetSVG(i, Verbose, options.output, uniToken).catch(() => undefined)
+      const ImageBuffer = await book.GetBackground(i, Verbose, options.output, Quality as 1 | 2 | 3 | 4)
 
-// Rips a book
-interface IRipOptions {
-    pages: string
-    quality: string
-    output: string
-    file: string
-    verbose: boolean
-}
-{
-    const Command = program.command("rip").description("Rip an online book")
+      const SVGUrl = SVGBuffer && `data:image/svg+xml;base64,${SVGBuffer.toString("base64")}`
+      const ImageUrl = `data:image/${ImageBuffer.BackgroundFType.toLowerCase()};base64,${ImageBuffer.Background.toString("base64")}`
 
-    // Arguments
-    Command.argument("<book-id>", "The book's id")
-    
-    // Options
-    Command.option("-p, --pages <number>", "The amount of pages to grab", "")
-    Command.option("-q, --quality <number>", "The quality of the background", "4")
-    Command.option("-o, --output <directory>", "The output directory", "./")
-    Command.option("-f, --file <directory>", "Config file path", "config.json")
-    Command.option("-v, --verbose", "Output what it is doing", true)
+      const dims = imageSize(ImageBuffer.Background)
+      const html = FormatPageTemplate(dims.height?.toString() || "", dims.width?.toString() || "", ImageUrl, SVGUrl)
 
-    // Main functionality
-    Command.action(async (BookId: string, Options: IRipOptions) => {
-        // Make sure is configured
-        if (!fs.existsSync(Options.file))
-            throw(new Error("Not configured. Please run configure first."))
-        
-        // Vars
-        const UserConfig = <IConfigureData>JSON.parse(fs.readFileSync(Options.file, "utf-8"))
-        const { CloudFrontCookies } = await Book.GenerateCloudFront(BookId, UserConfig["ASP.NET_SessionId"])
-        const Verbose = Options.verbose
+      VerboseLog(Verbose, "Info", `Built HTML for page ${i}`)
+      return { i, html, dims }
+    }
 
-        // Create the object
-        const book = new Book({
-            BookId,
-            //SessionId: UserConfig["ASP.NET_SessionId"],
-            CloudFront: CloudFrontCookies
-        })
+    // Process all pages
+    const pages = await Promise.all(Array.from({ length: Pages }, (_, i) => BuildPage(i + 1)))
 
-        // Make sure pages is a number
-        const Pages = parseInt(Options.pages || (await book.GetPageCount()).toString())
-        if (isNaN(Pages))
-            throw(new Error("pages - number not given"))
+    for (const { i, html, dims } of pages) {
+      if (!dims.height || !dims.width) {
+        VerboseLog(Verbose, "Error", `Missing dimensions for page ${i}`)
+        continue
+      }
 
-        // Make sure quality is a number
-        const Quality = parseInt(Options.quality)
-        if (isNaN(Quality))
-            throw(new Error("quality - not a number given"))
+      await page.setContent(html)
+      merger.add(await page.pdf({ height: dims.height, width: dims.width }))
+      VerboseLog(Verbose, "Success", `Added page ${i} to PDF`)
+    }
 
-        // Check the quality range
-        if (Quality < 1 || Quality > 4)
-            throw(new Error("quality - not within range 1-4 (inclusive)"))
+    await browser.close()
+    await merger.save(`${options.output}/${BookId}.pdf`)
+    console.log(chalk.bgGreen("Book ripped successfully"))
+  })
 
-        // Start puppeteer
-        VerboseLog(Verbose, "Info", "Starting puppeteer")
-        const browser = await puppeteer.launch()
-        VerboseLog(Verbose, "Info", "Started puppeteer")
-
-        // Vars
-        // const Details: any = await book.GetDetails()
-        const [ page ] = await browser.pages()
-        const merger = new PDFMerger()
-
-        // Build a singular page
-        async function BuildPage(i: number) {
-            // Grab the svg and background
-            let SVGBuffer = undefined
-            try {
-                SVGBuffer = await book.GetSVG(i, Verbose, Options.output)
-            } catch (e) { }
-            const ImageBuffer = await book.GetBackground(i, Verbose, Options.output, <any>Quality)
-
-            // Convert to base64
-            const SVGUrl = SVGBuffer && `data:image/svg+xml;base64, ${SVGBuffer.toString("base64")}`
-            const ImageUrl = `data:image/${ImageBuffer.BackgroundFType == "JPEG" ? "jpeg" : "png"};base64, ${ImageBuffer.Background.toString("base64")}`
-
-            // Creating the page
-            // const Header = <string>Object.values(Details.headers)[i]
-            const ImageDimensions = imageSize(ImageBuffer.Background)
-            const Page = FormatPageTemplate(ImageDimensions.height?.toString() || "", ImageDimensions.width?.toString() || "", ImageUrl, SVGUrl)
-
-            // Log
-            VerboseLog(Verbose, "Info", `Converted to html for ${BookId}:${i}`)
-
-            // Return
-            return {i, Page, ImageDimensions}
-        }
-
-        // Create promises for every page
-        const Promises = []
-        for (let i = 1; i < Pages + 1; i++) {
-            Promises.push(BuildPage(i))
-        }
-
-        // Wait for them to finish then sort them
-        const ResolvedPromises = await Promise.all(Promises)
-        ResolvedPromises.sort((a, b) => a.i - b.i)
-        
-        // Complete
-        const AddOne = (Quality == 2 || Quality == 3) ? Quality - 1 : 0
-        for (const PageData of ResolvedPromises) {
-            // Vars
-            const {i, Page, ImageDimensions} = PageData
-
-            // Ensure we got page dimensions
-            if (!ImageDimensions.height || !ImageDimensions.width) {
-                VerboseLog(Verbose, "Error", `No background for ${BookId}:${i}`)
-                continue
-            }
-
-            // Add to the merger
-            await page.setContent(Page)
-            merger.add(await page.pdf({
-                height: ImageDimensions.height + AddOne,
-                width: ImageDimensions.width + AddOne,
-            }))
-
-            // Done
-            VerboseLog(Verbose, "Success", `Converted to a pdf and added to merger for ${BookId}:${i}`)
-        }
-
-        // Save
-        await browser.close()
-        await merger.save(`${Options.output}/${BookId}.pdf`)
-
-        // Load pdf
-        // Completed
-        console.log(chalk.bgGreen("Done"))
-    })
-}
-
-// Parse it all
+// Parse CLI input
 program.parse(process.argv)
